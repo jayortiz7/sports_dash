@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from sqlalchemy import UniqueConstraints
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from sqlmodel import Field, Session, SQLModel, create_engine, select
@@ -37,6 +38,7 @@ class MatchBase(SQLModel):
 
 
 class Match(MatchBase, table=True):
+    __table_args__ = (UniqueConstraints("team_id", "opponent", "kickoff_utc"),)
     id: Optional[int] = Field(default=None, primary_key=True)
     team_id: int = Field(foreign_key="team.id", index=True)
 
@@ -49,6 +51,12 @@ class MatchRead(MatchBase):
     id: int
     team_id: int
     kickoff_local: datetime
+
+class MatchUpdate(MatchBase):
+    opponnent: Optional[str] = None
+    is_home: Optional[bool] = None
+    competition: Optional[str] = None
+    kickoff_local: Optional[datetime] = None
 
 
 # ---------- Helpers ----------
@@ -81,6 +89,11 @@ def to_read(match: Match, tz: ZoneInfo) -> MatchRead:
 
 def now_naive_utc() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+def to_naive_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        raise HTTPException(status_code=422, detail="kickoff_utc needs a timezone offset, e.g. 2026-11-02T20:00:00Z")
+    return dt.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 # ---------- App ----------
@@ -124,14 +137,56 @@ def delete_team(team_id: int, session: SessionDep):
 def add_match(team_id: int, match: MatchCreate, session: SessionDep, tz: TzDep):
     if not session.get(Team, team_id):
         raise HTTPException(status_code=404, detail="Team not found")
-    if match.kickoff_utc.tzinfo is None:
-        raise HTTPException(status_code=422, detail="kickoff_utc needs a timezone offset, e.g. 2026-11-02T20:00:00Z")
-    stored = match.kickoff_utc.astimezone(timezone.utc).replace(tzinfo=None)
+    stored = to_naive_utc(match.kickoff_utc)
     db_match = Match(**match.model_dump(exclude={"kickoff_utc"}), kickoff_utc=stored, team_id=team_id)
+    existing = session.exec(
+        select(Match).where(
+            Match.team_id == team_id,
+            Match.opponent == match.opponent,
+            Match.kickoff_utc == stored,
+        )
+    ).first()
+    if existing:
+        raise HTTPException(status_code=409, detail="Match already exists")
     session.add(db_match)
     session.commit()
     session.refresh(db_match)
     return to_read(db_match, tz)
+
+@app.patch("/teams/{team_id}/matches/{match_id}", response_model=MatchRead)
+def update_match(team_id: int, match_id: int, update: MatchUpdate, session: SessionDep, tz:TzDep):
+    db_match = session.get(Match, match_id)
+    if not db_match or db_match.team_id != team_id:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    changes = update.model_dump(exclude_unset=True)
+    if any(value is None for value in changes.values()):
+        raise HTTPException(status_code=422, detail="Fields cannot be null")
+
+    if "kickoff_utc" in changes:
+        kickoff = changes["kickoff_utc"]
+        changes["kickoff_utc"] = to_naive_utc(kickoff)
+
+    if "opponent" in changes or "kickoff_utc" in changes:
+        new_opponent = changes.get("opponent", db_match.opponent)
+        new_kickoff = changes.get("kickoff_utc", db_match.kickoff_utc)
+        existing = session.exec(
+            select(Match).where(
+                Match.team_id == team_id,
+                Match.id != match_id,
+                Match.opponent == new_opponent,
+                Match.kickoff_utc == new_kickoff
+            )
+        ).first()
+        if existing:
+            raise HTTPException(status_code=409, detail="Match already exists")
+    
+    db_match.sqlmodel_update(changes)
+    session.add(db_match)
+    session.commit()
+    session.refresh(db_match)
+    return to_read(db_match, tz)
+
 
 
 @app.get("/teams/{team_id}/matches/upcoming", response_model=list[MatchRead])
