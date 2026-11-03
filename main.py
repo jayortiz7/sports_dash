@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-from sqlalchemy import UniqueConstraints
+from sqlalchemy import UniqueConstraint
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from sqlmodel import Field, Session, SQLModel, create_engine, select
@@ -38,7 +38,7 @@ class MatchBase(SQLModel):
 
 
 class Match(MatchBase, table=True):
-    __table_args__ = (UniqueConstraints("team_id", "opponent", "kickoff_utc"),)
+    __table_args__ = (UniqueConstraint("team_id", "opponent", "kickoff_utc"),)
     id: Optional[int] = Field(default=None, primary_key=True)
     team_id: int = Field(foreign_key="team.id", index=True)
 
@@ -52,11 +52,11 @@ class MatchRead(MatchBase):
     team_id: int
     kickoff_local: datetime
 
-class MatchUpdate(MatchBase):
-    opponnent: Optional[str] = None
+class MatchUpdate(SQLModel):
+    opponent: Optional[str] = None
     is_home: Optional[bool] = None
     competition: Optional[str] = None
-    kickoff_local: Optional[datetime] = None
+    kickoff_utc: Optional[datetime] = None
 
 
 # ---------- Helpers ----------
