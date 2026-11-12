@@ -12,6 +12,10 @@ from sqlalchemy import UniqueConstraint
 from fastapi import Depends, FastAPI, HTTPException, Query
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 
+import httpx
+from sqlalchemy.exc import IntegrityError
+from espn import fetch_team_schedule, parse_event, find_team
+
 engine = create_engine("sqlite:///tracker.db", connect_args={"check_same_thread": False})
 
 
@@ -20,6 +24,8 @@ class TeamBase(SQLModel):
     name: str
     sport: str
     league: Optional[str] = None  # national teams play many competitions, so optional
+    espn_id: Optional[str] = None
+    provider_league: Optional[str] = None
 
 
 class Team(TeamBase, table=True):
@@ -41,6 +47,7 @@ class Match(MatchBase, table=True):
     __table_args__ = (UniqueConstraint("team_id", "opponent", "kickoff_utc"),)
     id: Optional[int] = Field(default=None, primary_key=True)
     team_id: int = Field(foreign_key="team.id", index=True)
+    external_id: Optional[str] = Field(default=None, index=True)
 
 
 class MatchCreate(MatchBase):
@@ -109,6 +116,19 @@ app = FastAPI(title="Match Tracker", lifespan=lifespan)
 # ---------- Teams ----------
 @app.post("/teams", response_model=Team, status_code=201)
 def create_team(team: TeamCreate, session: SessionDep):
+    if team.provider_league and not team.espn_id:
+        try:
+            found = find_team(team.provider_league, team.name)
+        except httpx.HTTPError:
+            raise HTTPException(status_code=502, detail="Could not reach ESPN")
+        if len(found) != 1:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Expected exactly one ESPN team matching {team.name!r}, found {len(found)}",
+            )
+        team.espn_id = found[0]["id"]
+        team.name = found[0]["displayName"]
+
     db_team = Team.model_validate(team)
     session.add(db_team)
     session.commit()
@@ -211,3 +231,59 @@ def all_upcoming(session: SessionDep, tz: TzDep, days: int = Query(7, ge=1, le=3
         .order_by(Match.kickoff_utc)
     )
     return [to_read(m, tz) for m in session.exec(stmt).all()]
+
+@app.post("/teams/{team_id}/sync")
+def sync_matches(team_id: int, session: SessionDep, season: int = Query(2026)):
+    team = session.get(Team, team_id)
+    if not team:
+        raise HTTPException(status_code=404, detail="Team not found")
+    if not team.espn_id or not team.provider_league:
+        raise HTTPException(status_code=404, detail="Team has no provider settings")
+
+    try:
+        events = fetch_team_schedule(team.provider_league, team.espn_id, season)
+    except httpx.HTTPError:
+        raise HTTPException(status_code=502, detail="Could not reach ESPN")
+    
+    created = updated = skipped = 0
+
+    for raw in events:
+        parsed = parse_event(raw, team.espn_id)
+        if parsed is None:
+            skipped += 1
+            continue
+        parsed["kickoff_utc"] = to_naive_utc(parsed["kickoff_utc"])
+
+        match = session.exec(
+            select(Match).where(
+                Match.team_id == team.id,
+                Match.external_id == parsed["external_id"]
+            )
+        ).first()
+
+        if match is None:
+            match = session.exec(
+                select(Match).where(
+                    Match.team_id == team.id,
+                    Match.external_id.is_(None),
+                    Match.opponent == parsed["opponent"],
+                    Match.kickoff_utc == parsed["kickoff_utc"],
+                )
+            ).first()
+
+        if match:
+            match.sqlmodel_update(parsed)
+            session.add(match)
+            updated += 1
+        else:
+            session.add(Match(**parsed, team_id=team.id))
+            created += 1
+
+    try:
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        raise HTTPException(status_code=409, detail="Sync conflicted with an existing match")
+
+    return {"created": created, "updated": updated, "skipped": skipped}
+        
