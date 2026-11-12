@@ -11,6 +11,9 @@ from sqlmodel.pool import StaticPool
 
 from main import app, get_session
 
+import httpx
+from test_espn import SAMPLE_EVENT
+
 
 # ---------- Fixtures ----------
 @pytest.fixture(name="session")
@@ -246,3 +249,20 @@ def test_all_upcoming_merges_teams_in_time_order(client: TestClient):
 
 def test_team_upcoming_for_missing_team_is_404(client: TestClient):
     assert client.get("/teams/999/matches/upcoming").status_code == 404
+
+
+# ------------- Fetch Schedule -----------------
+def test_sync_creates_then_updates(client: TestClient, monkeypatch):
+    monkeypatch.setattr("main.fetch_team_schedule", lambda *args, **kwargs: [SAMPLE_EVENT])
+
+    team = client.post("/teams", json={
+        "name": "Green Bay Packers", "sport": "football", "league": "NFL",
+        "espn_id": "9", "provider_league": "football/nfl",
+    }).json()
+
+    first = client.post(f"/teams/{team['id']}/sync")
+    assert first.status_code == 200
+    assert first.json() == {"created": 1, "updated": 0, "skipped": 0}
+
+    second = client.post(f"/teams/{team['id']}/sync")
+    assert second.json() == {"created": 0, "updated": 1, "skipped": 0}
